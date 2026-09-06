@@ -8,6 +8,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib import cm
 from PIL import Image
+from PIL import ImageDraw
 from scipy.interpolate import RegularGridInterpolator
 
 # Optional cartopy
@@ -18,10 +19,18 @@ try:
 except Exception:
     CARTOPY_AVAILABLE = False
 
-# NOTE: some Windows / Cartopy builds trigger C-level faults in this environment.
-# Disable Cartopy rendering by default to ensure the script runs. Set to True
-# manually if your env's Cartopy is stable.
-CARTOPY_AVAILABLE = False
+if CARTOPY_AVAILABLE:
+    try:
+        from cartopy.io import shapereader
+    except Exception:
+        shapereader = None
+else:
+    shapereader = None
+
+# NOTE: some Windows / Cartopy builds trigger C-level faults in some envs.
+# We keep CARTOPY_AVAILABLE set by the import check above. Use the
+# `--use-cartopy` flag to enable Cartopy plotting; the code will test and
+# fall back to the safe PIL output if Cartopy fails at runtime.
 
 
 class SuperResolutionWind:
@@ -103,12 +112,86 @@ class SuperResolutionWind:
         wind_direction = (np.degrees(np.arctan2(u10, v10)) % 360)
         return wind_speed, wind_direction, u10, v10
 
-    def plot_wind_detail(self, output_file):
+    def _overlay_coastlines_on_array(self, img_arr, lon_vals, lat_vals, line_color=(0,0,0,255), width=1):
+        """Draw coastlines from Natural Earth onto an RGBA numpy array and return a PIL Image."""
+        if shapereader is None:
+            return Image.fromarray(img_arr)
+        img = Image.fromarray(img_arr).convert('RGBA')
+        draw = ImageDraw.Draw(img)
+        lon_min, lon_max = float(lon_vals.min()), float(lon_vals.max())
+        lat_min, lat_max = float(lat_vals.min()), float(lat_vals.max())
+        H, W = img_arr.shape[0], img_arr.shape[1]
+
+        def proj_xy(lon, lat):
+            x = (lon - lon_min) / (lon_max - lon_min) * (W - 1)
+            y = (lat - lat_min) / (lat_max - lat_min) * (H - 1)
+            return (x, H - 1 - y)
+
+        try:
+            shp = shapereader.natural_earth(resolution='10m', category='physical', name='coastline')
+            reader = shapereader.Reader(shp)
+            for geom in reader.geometries():
+                try:
+                    coords = list(geom.coords)
+                    pts = [proj_xy(lon, lat) for lon, lat in coords]
+                    draw.line(pts, fill=line_color, width=width)
+                except Exception:
+                    for part in geom:
+                        try:
+                            coords = list(part.coords)
+                            pts = [proj_xy(lon, lat) for lon, lat in coords]
+                            draw.line(pts, fill=line_color, width=width)
+                        except Exception:
+                            continue
+        except Exception:
+            return Image.fromarray(img_arr)
+        return img
+
+    def plot_wind_detail(self, output_file, use_cartopy=False, coastline_overlay=False):
         if self.sr_ds is None:
             print('⚠️ Run super_resolve() first')
             return
         wind_speed, wind_direction, u10, v10 = self.get_wind_speed_and_direction()
 
+        # Try Cartopy rendering if requested and available
+        if use_cartopy and CARTOPY_AVAILABLE:
+            try:
+                fig = plt.figure(figsize=(16, 12))
+                axes = [fig.add_subplot(2, 2, i + 1, projection=ccrs.PlateCarree()) for i in range(4)]
+                axes = np.array(axes).reshape(2, 2)
+
+                ax = axes[0, 0]
+                ax.contourf(self.sr_ds.longitude.values, self.sr_ds.latitude.values, wind_speed, levels=20, cmap='RdYlBu_r', transform=ccrs.PlateCarree())
+                ax.contour(self.sr_ds.longitude.values, self.sr_ds.latitude.values, wind_speed, levels=10, colors='k', alpha=0.3, linewidths=0.5, transform=ccrs.PlateCarree())
+                skip = max(1, self.sr_factor)
+                ax.coastlines(resolution='10m')
+                ax.add_feature(cfeature.LAND, facecolor='lightgray', alpha=0.3)
+                ax.quiver(self.sr_ds.longitude.values[::skip], self.sr_ds.latitude.values[::skip], u10[::skip, ::skip], v10[::skip, ::skip], transform=ccrs.PlateCarree())
+                ax.set_title('Wind speed + vectors')
+
+                ax = axes[0, 1]
+                ax.contourf(self.sr_ds.longitude.values, self.sr_ds.latitude.values, u10, levels=20, cmap='RdBu_r', transform=ccrs.PlateCarree())
+                ax.coastlines(resolution='10m'); ax.add_feature(cfeature.LAND, facecolor='lightgray', alpha=0.3)
+                ax.set_title('U component')
+
+                ax = axes[1, 0]
+                ax.contourf(self.sr_ds.longitude.values, self.sr_ds.latitude.values, v10, levels=20, cmap='RdBu_r', transform=ccrs.PlateCarree())
+                ax.coastlines(resolution='10m'); ax.add_feature(cfeature.LAND, facecolor='lightgray', alpha=0.3)
+                ax.set_title('V component')
+
+                ax = axes[1, 1]
+                ax.contourf(self.sr_ds.longitude.values, self.sr_ds.latitude.values, wind_direction, levels=16, cmap=plt.cm.hsv, vmin=0, vmax=360, transform=ccrs.PlateCarree())
+                ax.coastlines(resolution='10m'); ax.add_feature(cfeature.LAND, facecolor='lightgray', alpha=0.3)
+                ax.set_title('Wind direction (deg)')
+
+                plt.savefig(output_file, dpi=150, bbox_inches='tight')
+                print(f"✅ Saved (Cartopy): {output_file}")
+                plt.close()
+                return
+            except Exception as e:
+                print('⚠️ Cartopy rendering failed; falling back to safe PIL output')
+
+        # Fallback: render images via PIL+colormap (safe)
         def to_rgba(arr, cmap_name='RdYlBu_r'):
             cmap = plt.get_cmap(cmap_name)
             a = np.array(arr, dtype=float)
@@ -127,15 +210,56 @@ class SuperResolutionWind:
         img4 = to_rgba(wind_direction, 'hsv')
 
         h, w, _ = img1.shape
-        mosaic = Image.new('RGBA', (w * 2, h * 2))
-        mosaic.paste(Image.fromarray(img1), (0, 0))
-        mosaic.paste(Image.fromarray(img2), (w, 0))
-        mosaic.paste(Image.fromarray(img3), (0, h))
-        mosaic.paste(Image.fromarray(img4), (w, h))
-        mosaic.save(output_file)
-        print(f"✅ Saved: {output_file}")
 
-    def plot_comparison(self, output_file):
+        def overlay_coastlines_on_array(img_arr, lon_vals, lat_vals, line_color=(0,0,0,255), width=1):
+            if shapereader is None:
+                return Image.fromarray(img_arr)
+            img = Image.fromarray(img_arr).convert('RGBA')
+            draw = ImageDraw.Draw(img)
+            lon_min, lon_max = float(lon_vals.min()), float(lon_vals.max())
+            lat_min, lat_max = float(lat_vals.min()), float(lat_vals.max())
+            H, W = img_arr.shape[0], img_arr.shape[1]
+
+            def proj_xy(lon, lat):
+                x = (lon - lon_min) / (lon_max - lon_min) * (W - 1)
+                y = (lat - lat_min) / (lat_max - lat_min) * (H - 1)
+                return (x, H - 1 - y)
+
+            try:
+                shp = shapereader.natural_earth(resolution='10m', category='physical', name='coastline')
+                reader = shapereader.Reader(shp)
+                for geom in reader.geometries():
+                    # geom may be LineString or MultiLineString
+                    try:
+                        coords = list(geom.coords)
+                        pts = [proj_xy(lon, lat) for lon, lat in coords]
+                        draw.line(pts, fill=line_color, width=width)
+                    except Exception:
+                        # handle multipart
+                        for part in geom:
+                            try:
+                                coords = list(part.coords)
+                                pts = [proj_xy(lon, lat) for lon, lat in coords]
+                                draw.line(pts, fill=line_color, width=width)
+                            except Exception:
+                                continue
+            except Exception:
+                return Image.fromarray(img_arr)
+            return img
+
+        mosaic = Image.new('RGBA', (w * 2, h * 2))
+        panel1 = self._overlay_coastlines_on_array(img1, self.sr_ds.longitude.values, self.sr_ds.latitude.values) if coastline_overlay else Image.fromarray(img1)
+        panel2 = self._overlay_coastlines_on_array(img2, self.sr_ds.longitude.values, self.sr_ds.latitude.values) if coastline_overlay else Image.fromarray(img2)
+        panel3 = self._overlay_coastlines_on_array(img3, self.sr_ds.longitude.values, self.sr_ds.latitude.values) if coastline_overlay else Image.fromarray(img3)
+        panel4 = self._overlay_coastlines_on_array(img4, self.sr_ds.longitude.values, self.sr_ds.latitude.values) if coastline_overlay else Image.fromarray(img4)
+        mosaic.paste(panel1, (0, 0))
+        mosaic.paste(panel2, (w, 0))
+        mosaic.paste(panel3, (0, h))
+        mosaic.paste(panel4, (w, h))
+        mosaic.save(output_file)
+        print(f"✅ Saved (PIL): {output_file}")
+
+    def plot_comparison(self, output_file, use_cartopy=False, coastline_overlay=False):
         if self.sr_ds is None:
             print('⚠️ Run super_resolve() first')
             return
@@ -147,6 +271,28 @@ class SuperResolutionWind:
             v10_orig = self.ds['v10'].values
         wind_orig = np.sqrt(u10_orig ** 2 + v10_orig ** 2)
         wind_sr, _, u10_sr, v10_sr = self.get_wind_speed_and_direction()
+
+        # Try Cartopy comparison if requested
+        if use_cartopy and CARTOPY_AVAILABLE:
+            try:
+                fig = plt.figure(figsize=(14, 5))
+                ax1 = fig.add_subplot(1, 2, 1, projection=ccrs.PlateCarree())
+                ax2 = fig.add_subplot(1, 2, 2, projection=ccrs.PlateCarree())
+
+                ax1.contourf(self.ds.longitude.values, self.ds.latitude.values, wind_orig, levels=20, cmap='RdYlBu_r', transform=ccrs.PlateCarree())
+                ax1.coastlines(resolution='10m'); ax1.add_feature(cfeature.LAND, facecolor='lightgray', alpha=0.3)
+                ax1.set_title('Original')
+
+                ax2.contourf(self.sr_ds.longitude.values, self.sr_ds.latitude.values, wind_sr, levels=20, cmap='RdYlBu_r', transform=ccrs.PlateCarree())
+                ax2.coastlines(resolution='10m'); ax2.add_feature(cfeature.LAND, facecolor='lightgray', alpha=0.3)
+                ax2.set_title(f'SR {self.sr_factor}x')
+
+                plt.savefig(output_file, dpi=150, bbox_inches='tight')
+                print(f"✅ Saved (Cartopy): {output_file}")
+                plt.close()
+                return
+            except Exception:
+                print('⚠️ Cartopy comparison failed; falling back to safe PIL output')
 
         def to_rgba(arr, cmap_name='RdYlBu_r'):
             cmap = plt.get_cmap(cmap_name)
@@ -163,11 +309,17 @@ class SuperResolutionWind:
         img1 = to_rgba(wind_orig)
         img2 = to_rgba(wind_sr)
         h, w, _ = img1.shape
+        if coastline_overlay:
+            panel1 = self._overlay_coastlines_on_array(img1, self.ds.longitude.values, self.ds.latitude.values)
+            panel2 = self._overlay_coastlines_on_array(img2, self.sr_ds.longitude.values, self.sr_ds.latitude.values)
+        else:
+            panel1 = Image.fromarray(img1)
+            panel2 = Image.fromarray(img2)
         mosaic = Image.new('RGBA', (w * 2, h))
-        mosaic.paste(Image.fromarray(img1), (0, 0))
-        mosaic.paste(Image.fromarray(img2), (w, 0))
+        mosaic.paste(panel1, (0, 0))
+        mosaic.paste(panel2, (w, 0))
         mosaic.save(output_file)
-        print(f"✅ Saved: {output_file}")
+        print(f"✅ Saved (PIL): {output_file}")
         plt.close()
 
     def print_statistics(self):
@@ -182,6 +334,8 @@ def main():
     parser = argparse.ArgumentParser(description='Super-resolution wind tool')
     parser.add_argument('--sr-factor', type=int, default=2, choices=[1, 2, 3, 4])
     parser.add_argument('--compare', action='store_true')
+    parser.add_argument('--use-cartopy', action='store_true', help='Try to render with Cartopy (optional, may crash on some Windows envs)')
+    parser.add_argument('--coastline-overlay', action='store_true', help='Overlay coastlines (uses Natural Earth via Cartopy shapereader)')
     parser.add_argument('--input', type=str, default='taiwan_test_data.nc')
     parser.add_argument('--time-index', type=int, default=0)
     parser.add_argument('--out-dir', type=str, default='CorrDiff/outputs')
@@ -193,10 +347,10 @@ def main():
     sr = SuperResolutionWind(input_file=args.input, sr_factor=args.sr_factor, time_index=args.time_index)
     sr.super_resolve()
     detail_path = os.path.join(out_dir, f'wind_detail_sr{args.sr_factor}x.png')
-    sr.plot_wind_detail(detail_path)
+    sr.plot_wind_detail(detail_path, use_cartopy=args.use_cartopy, coastline_overlay=args.coastline_overlay)
     if args.compare:
         compare_path = os.path.join(out_dir, f'wind_comparison_{args.sr_factor}x.png')
-        sr.plot_comparison(compare_path)
+        sr.plot_comparison(compare_path, use_cartopy=args.use_cartopy, coastline_overlay=args.coastline_overlay)
     sr.print_statistics()
 
 
