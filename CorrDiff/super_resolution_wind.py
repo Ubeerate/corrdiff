@@ -33,6 +33,11 @@ else:
 # fall back to the safe PIL output if Cartopy fails at runtime.
 
 
+# Default time value (edit this string to quickly switch plot time)
+# Examples: "2020-06-25" or "2020-06-25T00:00"
+TIME_VALUE_DEFAULT = "2020-06-25"
+
+
 class SuperResolutionWind:
     """Super-resolution helper for u10/v10 wind fields on a regular lat/lon grid."""
 
@@ -397,7 +402,10 @@ def main():
     out_dir = args.out_dir
     os.makedirs(out_dir, exist_ok=True)
 
-    sr = SuperResolutionWind(input_file=args.input, sr_factor=args.sr_factor, time_index=args.time_index, time_value=args.time_value)
+    # Determine time_value: prefer CLI --time-value, otherwise use TIME_VALUE_DEFAULT
+    time_value_to_use = args.time_value if args.time_value is not None else TIME_VALUE_DEFAULT
+
+    sr = SuperResolutionWind(input_file=args.input, sr_factor=args.sr_factor, time_index=args.time_index, time_value=time_value_to_use)
     sr.super_resolve()
     detail_path = os.path.join(out_dir, f'wind_detail_sr{args.sr_factor}x.png')
     sr.plot_wind_detail(detail_path, use_cartopy=args.use_cartopy, coastline_overlay=args.coastline_overlay)
