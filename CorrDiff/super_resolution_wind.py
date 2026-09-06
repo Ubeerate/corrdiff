@@ -36,13 +36,15 @@ else:
 class SuperResolutionWind:
     """Super-resolution helper for u10/v10 wind fields on a regular lat/lon grid."""
 
-    def __init__(self, input_file, sr_factor=2, time_index=0):
+    def __init__(self, input_file, sr_factor=2, time_index=0, time_value=None):
         self.input_file = input_file
         self.sr_factor = int(sr_factor)
         self.time_index = int(time_index)
+        self.time_value = time_value
         self.ds = None
         self.sr_ds = None
         self.has_time = False
+        self.time_dim = None
         self.load_data()
 
     def load_data(self):
@@ -52,15 +54,65 @@ class SuperResolutionWind:
         if self.ds['u10'].ndim == 3:
             self.has_time = True
             time_dim = self.ds['u10'].dims[0]
+            self.time_dim = time_dim
             try:
                 ntime = len(self.ds[time_dim])
             except Exception:
                 ntime = self.ds['u10'].shape[0]
             print(f"✅ Original resolution: {len(self.ds.latitude)} × {len(self.ds.longitude)} (time: {ntime})")
-            print(f"🔧 using time_index = {self.time_index}")
+            # If a time_value string was provided, resolve it to an index
+            if self.time_value is not None:
+                resolved = self._time_index_for_value(self.time_value)
+                if resolved is not None:
+                    self.time_index = int(resolved)
+                    print(f"🔧 resolved time_value {self.time_value} -> time_index = {self.time_index}")
+                else:
+                    print(f"⚠️ could not resolve time_value {self.time_value}; using time_index = {self.time_index}")
+            else:
+                print(f"🔧 using time_index = {self.time_index}")
         else:
             self.has_time = False
             print(f"✅ Original resolution: {len(self.ds.latitude)} × {len(self.ds.longitude)}")
+
+    def _time_index_for_value(self, time_value):
+        """Resolve a user-supplied time_value (string or numeric) to the nearest index on the dataset time coordinate.
+        Returns integer index or None if resolution failed."""
+        if self.time_dim is None:
+            return None
+        times = self.ds[self.time_dim].values
+        try:
+            # datetimelike
+            if np.issubdtype(times.dtype, np.datetime64):
+                try:
+                    target = np.datetime64(time_value)
+                except Exception:
+                    # try parsing with pandas if available
+                    try:
+                        import pandas as pd
+                        target = np.datetime64(pd.to_datetime(time_value))
+                    except Exception:
+                        return None
+                diffs = np.abs(times - target)
+                idx = int(diffs.argmin())
+                return idx
+            # numeric times
+            elif np.issubdtype(times.dtype, np.number):
+                try:
+                    val = float(time_value)
+                except Exception:
+                    return None
+                diffs = np.abs(times - val)
+                idx = int(diffs.argmin())
+                return idx
+            else:
+                # fallback: string match
+                str_times = np.array([str(t) for t in times])
+                matches = np.where(str_times == str(time_value))[0]
+                if len(matches) > 0:
+                    return int(matches[0])
+                return None
+        except Exception:
+            return None
 
     def super_resolve(self):
         """Create a higher-resolution dataset using interpolation."""
@@ -264,8 +316,8 @@ class SuperResolutionWind:
             print('⚠️ Run super_resolve() first')
             return
         if self.ds['u10'].ndim == 3:
-            u10_orig = self.ds['u10'][0].values
-            v10_orig = self.ds['v10'][0].values
+            u10_orig = self.ds['u10'][self.time_index].values
+            v10_orig = self.ds['v10'][self.time_index].values
         else:
             u10_orig = self.ds['u10'].values
             v10_orig = self.ds['v10'].values
@@ -338,13 +390,14 @@ def main():
     parser.add_argument('--coastline-overlay', action='store_true', help='Overlay coastlines (uses Natural Earth via Cartopy shapereader)')
     parser.add_argument('--input', type=str, default='taiwan_test_data.nc')
     parser.add_argument('--time-index', type=int, default=0)
+    parser.add_argument('--time-value', type=str, default=None, help='Time value (string or numeric) to resolve to a time index')
     parser.add_argument('--out-dir', type=str, default='CorrDiff/outputs')
 
     args = parser.parse_args()
     out_dir = args.out_dir
     os.makedirs(out_dir, exist_ok=True)
 
-    sr = SuperResolutionWind(input_file=args.input, sr_factor=args.sr_factor, time_index=args.time_index)
+    sr = SuperResolutionWind(input_file=args.input, sr_factor=args.sr_factor, time_index=args.time_index, time_value=args.time_value)
     sr.super_resolve()
     detail_path = os.path.join(out_dir, f'wind_detail_sr{args.sr_factor}x.png')
     sr.plot_wind_detail(detail_path, use_cartopy=args.use_cartopy, coastline_overlay=args.coastline_overlay)
